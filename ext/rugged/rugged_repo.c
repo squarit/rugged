@@ -10,6 +10,7 @@
 #include <git2/sys/odb_backend.h>
 #include <git2/sys/refdb_backend.h>
 #include <git2/refs.h>
+#include <git2/apply.h>
 
 extern VALUE rb_mRugged;
 extern VALUE rb_eRuggedError;
@@ -18,6 +19,7 @@ extern VALUE rb_cRuggedConfig;
 extern VALUE rb_cRuggedBackend;
 extern VALUE rb_cRuggedRemote;
 extern VALUE rb_cRuggedCommit;
+extern VALUE rb_cRuggedDiff;
 extern VALUE rb_cRuggedTag;
 extern VALUE rb_cRuggedTree;
 extern VALUE rb_cRuggedReference;
@@ -182,7 +184,7 @@ static void rugged_repo_new_with_backend(git_repository **repo, VALUE rb_path, V
 
 	int error = 0;
 
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 	path = StringValueCStr(rb_path);
 
 	if (rb_obj_is_kind_of(rb_backend, rb_cRuggedBackend) == Qfalse) {
@@ -291,7 +293,7 @@ static VALUE rb_git_repo_open_bare(int argc, VALUE *argv, VALUE klass)
 	}
 
 	if (!repo) {
-		Check_Type(rb_path, T_STRING);
+		FilePathValue(rb_path);
 
 		error = git_repository_open_bare(&repo, StringValueCStr(rb_path));
 		rugged_exception_check(error);
@@ -335,7 +337,7 @@ static VALUE rb_git_repo_new(int argc, VALUE *argv, VALUE klass)
 	VALUE rb_path, rb_options;
 
 	rb_scan_args(argc, argv, "10:", &rb_path, &rb_options);
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 
 	error = git_repository_open(&repo, StringValueCStr(rb_path));
 	rugged_exception_check(error);
@@ -377,7 +379,7 @@ static VALUE rb_git_repo_init_at(int argc, VALUE *argv, VALUE klass)
 	int error;
 
 	rb_scan_args(argc, argv, "11:", &rb_path, &rb_is_bare, &rb_options);
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 
 	if (!NIL_P(rb_options)) {
 		/* Check for `:backend` */
@@ -394,6 +396,98 @@ static VALUE rb_git_repo_init_at(int argc, VALUE *argv, VALUE klass)
 	}
 
 	return rugged_repo_new(klass, repo);
+}
+
+static int apply_cb_result(int exception, VALUE result)
+{
+	if (exception || result == Qnil) {
+		return GIT_EAPPLYFAIL;
+	} else {
+		if (RTEST(result)) {
+			return 0;
+		} else {
+			return 1;
+		}
+	}
+}
+
+static int apply_delta_cb(const git_diff_delta *delta, void *data)
+{
+	struct rugged_apply_cb_payload *payload = data;
+	VALUE args = rb_ary_new2(2);
+	VALUE result;
+
+	if (NIL_P(payload->delta_cb))
+		return 0;
+
+	VALUE rb_delta = rugged_diff_delta_new(Qnil, delta);
+
+	rb_ary_push(args, payload->delta_cb);
+	rb_ary_push(args, rb_delta);
+
+	result = rb_protect(rugged__block_yield_splat, args, &payload->exception);
+
+	return apply_cb_result(payload->exception, result);
+}
+
+static int apply_hunk_cb(const git_diff_hunk *hunk, void *data)
+{
+	struct rugged_apply_cb_payload *payload = data;
+	VALUE args = rb_ary_new2(2);
+	VALUE result;
+
+	if (NIL_P(payload->hunk_cb))
+		return 0;
+
+	VALUE rb_hunk = rugged_diff_hunk_new(Qnil, 0, hunk, 0);
+
+	rb_ary_push(args, payload->hunk_cb);
+	rb_ary_push(args, rb_hunk);
+
+	result = rb_protect(rugged__block_yield_splat, args, &payload->exception);
+
+	return apply_cb_result(payload->exception, result);
+}
+
+static void rugged_parse_apply_options(git_apply_options *opts, git_apply_location_t *location, VALUE rb_options, struct rugged_apply_cb_payload *payload)
+{
+	if (!NIL_P(rb_options)) {
+		VALUE rb_value;
+		Check_Type(rb_options, T_HASH);
+
+		rb_value = rb_hash_aref(rb_options, CSTR2SYM("location"));
+		if (!NIL_P(rb_value)) {
+			ID id_location;
+
+			Check_Type(rb_value, T_SYMBOL);
+			id_location = SYM2ID(rb_value);
+
+			if (id_location == rb_intern("both")) {
+				*location = GIT_APPLY_LOCATION_BOTH;
+			} else if (id_location == rb_intern("index")) {
+				*location = GIT_APPLY_LOCATION_INDEX;
+			} else if (id_location == rb_intern("workdir")) {
+				*location = GIT_APPLY_LOCATION_WORKDIR;
+			} else {
+				rb_raise(rb_eTypeError,
+					"Invalid location. Expected `:both`, `:index`, or `:workdir`");
+			}
+		}
+
+		opts->payload = payload;
+
+		payload->delta_cb = rb_hash_aref(rb_options, CSTR2SYM("delta_callback"));
+		if (!NIL_P(payload->delta_cb)) {
+			CALLABLE_OR_RAISE(payload->delta_cb, "delta_callback");
+			opts->delta_cb = apply_delta_cb;
+		}
+
+		payload->hunk_cb = rb_hash_aref(rb_options, CSTR2SYM("hunk_callback"));
+		if (!NIL_P(payload->hunk_cb)) {
+			CALLABLE_OR_RAISE(payload->hunk_cb, "hunk_callback");
+			opts->hunk_cb = apply_hunk_cb;
+		}
+	}
 }
 
 static void parse_clone_options(git_clone_options *ret, VALUE rb_options, struct rugged_remote_cb_payload *remote_payload)
@@ -474,7 +568,7 @@ static VALUE rb_git_repo_clone_at(int argc, VALUE *argv, VALUE klass)
 
 	rb_scan_args(argc, argv, "21", &url, &local_path, &rb_options_hash);
 	Check_Type(url, T_STRING);
-	Check_Type(local_path, T_STRING);
+	FilePathValue(local_path);
 
 	parse_clone_options(&options, rb_options_hash, &remote_payload);
 
@@ -870,6 +964,69 @@ static VALUE rb_git_repo_revert_commit(int argc, VALUE *argv, VALUE self)
 
 /*
  *  call-seq:
+ *    repo.apply(diff, options = {}) -> true or false
+ *
+ *	Applies the given diff to the repository.
+ *  The following options can be passed in the +options+ Hash:
+ *
+ *  :location ::
+ *    Whether to apply the changes to the workdir (default for non-bare),
+ *    the index (default for bare) or both. Valid values: +:index+, +:workdir+,
+ *    +:both+.
+ *
+ *  :delta_callback ::
+ *    While applying the patch, this callback will be executed per delta (file).
+ *    The current +delta+ will be passed to the block. The block's return value
+ *    determines further behavior. When the block evaluates to:
+ *       - +true+: the hunk will be applied and the apply process will continue.
+ *       - +false+: the hunk will be skipped, but the apply process continues.
+ *       - +nil+: the hunk is not applied, and the apply process is aborted.
+ *
+ *  :hunk_callback ::
+ *    While applying the patch, this callback will be executed per hunk.
+ *    The current +hunk+ will be passed to the block. The block's return value
+ *    determines further behavior, as per +:delta_callback+.
+ *
+ */
+static VALUE rb_git_repo_apply(int argc, VALUE *argv, VALUE self)
+{
+	VALUE rb_diff, rb_options;
+	git_diff *diff;
+	git_repository *repo;
+	git_apply_options opts = GIT_APPLY_OPTIONS_INIT;
+	git_apply_location_t location;
+	struct rugged_apply_cb_payload payload = { Qnil, Qnil, 0 };
+	int error;
+
+	Data_Get_Struct(self, git_repository, repo);
+	if (git_repository_is_bare(repo)) {
+		location = GIT_APPLY_LOCATION_INDEX;
+	} else {
+		location = GIT_APPLY_LOCATION_WORKDIR;
+	}
+
+	rb_scan_args(argc, argv, "11", &rb_diff, &rb_options);
+
+	if (!rb_obj_is_kind_of(rb_diff, rb_cRuggedDiff)) {
+		rb_raise(rb_eArgError, "Expected a Rugged::Diff.");
+	}
+
+	if (!NIL_P(rb_options)) {
+		Check_Type(rb_options, T_HASH);
+		rugged_parse_apply_options(&opts, &location, rb_options, &payload);
+	}
+
+	Data_Get_Struct(rb_diff, git_diff, diff);
+
+	error = git_apply(repo, diff, location, &opts);
+
+	rugged_exception_check(error);
+
+	return Qtrue;
+}
+
+/*
+ *  call-seq:
  *    repo.merge_commits(our_commit, their_commit, options = {}) -> index
  *
  *  Merges the two given commits, returning a Rugged::Index that reflects
@@ -1180,7 +1337,7 @@ static VALUE rb_git_repo_hashfile(VALUE self, VALUE rb_path, VALUE rb_type)
 	int error;
 	git_oid oid;
 
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 
 	error = git_odb_hashfile(&oid,
 		StringValueCStr(rb_path),
@@ -1455,7 +1612,7 @@ static VALUE rb_git_repo_discover(int argc, VALUE *argv, VALUE klass)
 		across_fs = rugged_parse_bool(rb_across_fs);
 	}
 
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 
 	error = git_repository_discover(
 		&repository_path,
@@ -1467,7 +1624,7 @@ static VALUE rb_git_repo_discover(int argc, VALUE *argv, VALUE klass)
 	rugged_exception_check(error);
 
 	error = git_repository_open(&repo, repository_path.ptr);
-	git_buf_free(&repository_path);
+	git_buf_dispose(&repository_path);
 
 	rugged_exception_check(error);
 
@@ -1502,15 +1659,6 @@ static VALUE flags_to_rb(unsigned int flags)
 	return rb_flags;
 }
 
-static int rugged__status_cb(const char *path, unsigned int flags, void *payload)
-{
-	rb_funcall((VALUE)payload, rb_intern("call"), 2,
-		rb_str_new_utf8(path), flags_to_rb(flags)
-	);
-
-	return GIT_OK;
-}
-
 static VALUE rb_git_repo_file_status(VALUE self, VALUE rb_path)
 {
 	unsigned int flags;
@@ -1518,7 +1666,7 @@ static VALUE rb_git_repo_file_status(VALUE self, VALUE rb_path)
 	git_repository *repo;
 
 	Data_Get_Struct(self, git_repository, repo);
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 	error = git_status_file(&flags, repo, StringValueCStr(rb_path));
 	rugged_exception_check(error);
 
@@ -1527,8 +1675,10 @@ static VALUE rb_git_repo_file_status(VALUE self, VALUE rb_path)
 
 static VALUE rb_git_repo_file_each_status(VALUE self)
 {
-	int error;
+	int error, exception;
+	size_t i, nentries;
 	git_repository *repo;
+	git_status_list *list;
 
 	Data_Get_Struct(self, git_repository, repo);
 
@@ -1537,13 +1687,30 @@ static VALUE rb_git_repo_file_each_status(VALUE self)
 			"A block was expected for iterating through "
 			"the repository contents.");
 
-	error = git_status_foreach(
-		repo,
-		&rugged__status_cb,
-		(void *)rb_block_proc()
-	);
-
+	error = git_status_list_new(&list, repo, NULL);
 	rugged_exception_check(error);
+
+	nentries = git_status_list_entrycount(list);
+	for (i = 0; i < nentries; i++) {
+		const git_status_entry *entry;
+		const char *path;
+		VALUE args;
+
+		entry = git_status_byindex(list, i);
+
+		path = entry->head_to_index ?
+		       entry->head_to_index->old_file.path :
+		       entry->index_to_workdir->old_file.path;
+		args = rb_ary_new3(2, rb_str_new_utf8(path), flags_to_rb(entry->status));
+		rb_protect(rb_yield, args, &exception);
+		if (exception != 0)
+			break;
+	}
+	git_status_list_free(list);
+
+	if (exception != 0)
+		rb_jump_tag(exception);
+
 	return Qnil;
 }
 
@@ -2365,7 +2532,7 @@ static VALUE rb_git_repo_attributes(int argc, VALUE *argv, VALUE self)
 	rb_scan_args(argc, argv, "12", &rb_path, &rb_names, &rb_options);
 
 	Data_Get_Struct(self, git_repository, repo);
-	Check_Type(rb_path, T_STRING);
+	FilePathValue(rb_path);
 
 	if (!NIL_P(rb_options)) {
 		Check_Type(rb_options, T_FIXNUM);
@@ -2543,6 +2710,29 @@ static VALUE rb_git_repo_cherrypick_commit(int argc, VALUE *argv, VALUE self)
 	return rugged_index_new(rb_cRuggedIndex, self, index);
 }
 
+/*
+ *  call-seq: repo.diff_from_buffer(buffer) -> Rugged::Diff object
+ *  
+ *  Where +buffer+ is a +String+.
+ *  Returns A Rugged::Diff object
+ */
+static VALUE rb_git_diff_from_buffer(VALUE self, VALUE rb_buffer)
+{
+	git_diff *diff = NULL;
+	const char *buffer;
+	size_t len;
+	int error;
+
+	Check_Type(rb_buffer, T_STRING);
+	buffer = RSTRING_PTR(rb_buffer);
+	len = RSTRING_LEN(rb_buffer);
+
+	error = git_diff_from_buffer(&diff, buffer, len);
+	rugged_exception_check(error);
+
+	return rugged_diff_new(rb_cRuggedDiff, self, diff);
+}
+
 void Init_rugged_repo(void)
 {
 	id_call = rb_intern("call");
@@ -2598,7 +2788,11 @@ void Init_rugged_repo(void)
 	rb_define_method(rb_cRuggedRepo, "merge_analysis", rb_git_repo_merge_analysis, -1);
 	rb_define_method(rb_cRuggedRepo, "merge_commits", rb_git_repo_merge_commits, -1);
 
+	rb_define_method(rb_cRuggedRepo, "apply", rb_git_repo_apply, -1);
+
 	rb_define_method(rb_cRuggedRepo, "revert_commit", rb_git_repo_revert_commit, -1);
+	
+	rb_define_method(rb_cRuggedRepo, "diff_from_buffer", rb_git_diff_from_buffer, 1);
 
 	rb_define_method(rb_cRuggedRepo, "path_ignored?", rb_git_repo_is_path_ignored, 1);
 

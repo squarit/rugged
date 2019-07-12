@@ -20,9 +20,12 @@
 #include <ruby/encoding.h>
 #endif
 
+#include <ruby/util.h>
+
 #include <assert.h>
 #include <git2.h>
 #include <git2/odb_backend.h>
+#include <git2/sys/path.h>
 
 #define rb_str_new_utf8(str) rb_enc_str_new(str, strlen(str), rb_utf8_encoding())
 #define CSTR2SYM(s) (ID2SYM(rb_intern((s))))
@@ -101,6 +104,12 @@ VALUE rugged_signature_from_buffer(const char *buffer, const char *encoding_name
 void rugged_rb_ary_to_strarray(VALUE rb_array, git_strarray *str_array);
 VALUE rugged_strarray_to_rb_ary(git_strarray *str_array);
 
+#define CALLABLE_OR_RAISE(ret, name) \
+	do { \
+		if (!rb_respond_to(ret, rb_intern("call"))) \
+			rb_raise(rb_eArgError, "Expected a Proc or an object that responds to #call (:" name " )."); \
+	} while (0);
+
 static inline void rugged_set_owner(VALUE object, VALUE owner)
 {
 	rb_iv_set(object, "@owner", owner);
@@ -130,6 +139,13 @@ static inline int rugged_parse_bool(VALUE boolean)
 extern VALUE rb_cRuggedRepo;
 
 VALUE rugged__block_yield_splat(VALUE args);
+
+struct rugged_apply_cb_payload
+{
+	VALUE delta_cb;
+	VALUE hunk_cb;
+	int exception;
+};
 
 struct rugged_cb_payload
 {
@@ -172,5 +188,7 @@ typedef struct _rugged_backend {
   int (* odb_backend)(git_odb_backend **backend_out, struct _rugged_backend *backend, const char* path);
   int (* refdb_backend)(git_refdb_backend **backend_out, struct _rugged_backend *backend, const char* path);
 } rugged_backend;
+
+extern void rugged_set_allocator(void);
 
 #endif
